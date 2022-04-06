@@ -1,4 +1,4 @@
-# deaf_gex
+# Influence of deafening on gene expression in birdsong vocal motor circuitry
 Analysis of the effects of deafening on birdsong and gene expression in birdsong neural circuitry. 
 
 The repository is divided into three main parts:
