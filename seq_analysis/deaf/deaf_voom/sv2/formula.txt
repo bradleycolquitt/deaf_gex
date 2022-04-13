@@ -1,0 +1,6 @@
+~0 + position +
+position:num_songs_on_euth_date_log_scale +
+position:kl_mean_log_scale_cut2_proc2 +
+position:kl_mean_log_scale_cut2_proc2:num_songs_on_euth_date_log_scale + 
+position:nsongs_per_day_pre_log_scale + 
+cdr_scaled + frac_mito_scale + sv1 + sv2

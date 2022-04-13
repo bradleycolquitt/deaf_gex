@@ -1,0 +1,764 @@
+
+```{r}
+source("~/data2/rstudio/birds/utils/seq_packages.R")
+source("~/data2/rstudio/birds/utils/seq_analysis.R")
+source("~/data2/rstudio/birds/utils/db.R")
+#source("~/data2/rstudio/birds/utils/go.R")
+source("~/data2/rstudio/birds/utils/ggplot.R")
+#source("~/data2/rstudio/birds/utils/voom.R")
+source("~/data2/rstudio/birds/utils/stats.R")
+source("~/data2/rstudio/birds/utils/common_aesthetics.R")
+#library(scde)
+#library(limma)
+library(edgeR)
+library(sva)
+#library(impute)
+library(reshape2)
+#library(wrapr)
+#library(here)
+library(cowplot)
+
+library(rtracklayer)
+library(GenomicFeatures)
+
+
+library(BUSpaRse)
+library(data.table)
+library(Seurat)
+library(qs)
+#library(SingleCellExperiment)
+##BiocParallel::register(MulticoreParam(6))
+#BiocParallel::register(SerialParam())
+
+select = dplyr::select 
+filter = dplyr::filter
+acast = reshape2::acast
+```
+
+```{r}
+options(httr_oob_default=TRUE)
+# gs_auth(new_user = TRUE)
+# gs_ls()
+```
+
+```{r}
+pools = 1:28
+
+data_dirs = list(c("/mnt/hugin/fastq/160712/merge/", pool=list(1:28)),
+                 c("/mnt/hugin/fastq/180913/", pool=list(1:8)))
+
+dates = map_chr(data_dirs, function(x) str_extract(x[[1]], "[0-9]{6}"))
+genecounts_dir = map(data_dirs, function(data_dir) file.path(data_dir[[1]], sprintf("kallisto/lonStrDom2_merge/pool%s/genecounts", data_dir[[2]])))
+prefix = "~/data2/rstudio/birds/singing/seq_analysis"
+out_dir = file.path(prefix, "summaries")
+script_name = "deaf_bus_trimmed_merge_3p_seurat"
+out_dir = file.path(out_dir, script_name)
+dir.create(out_dir, recursive = T)
+
+figures_dir = file.path(out_dir, "figures")
+dir.create(figures_dir)
+```
+
+
+## Load index, barcode info
+```{r}
+bcs = read_delim("~/lib/barcodes/bc24.txt", delim = "\t", col_names=c("barcode", "sequence"))
+indices = read_delim(file.path(data_dirs[[1]][[1]], "pool_index.txt"), delim=",", col_names=c("sequence", "index"))
+indices$pool = 1:nrow(indices)
+indices = indices %>% mutate(index1 = sub("N", "", index))
+indices_cur = indices
+#indices_cur = indices %>% filter(pool %in% pools)
+```
+## Load Data
+```{r}
+res_mats = 
+  map(genecounts_dir, function(gds) {
+    map(gds, function(x) {
+      res_mat = read_count_output(x, name = "genes", tcc = FALSE)
+      rnames = rownames(res_mat)
+      rnames = sub("gene-", "", rnames)
+      rownames(res_mat) = rnames
+      colnames(res_mat) = bcs$barcode[match(colnames(res_mat), bcs$sequence)]
+      res_mat
+    })
+  })
+
+names(res_mats) = dates
+```
+
+
+## Prep metadata
+```{r}
+info_dbs = list(c("deaf1/info.db",  "db_info_switch160730_14d"),
+                c("topo.db", "db_info"),
+                c("ulman/info.db", "db_info"))
+
+info = map_dfr(info_dbs, function(x) {
+   info_sub = load_umi_info(x[1], x[2])
+   info_sub[,!grepl("anesthetic.lot..if.applicable.", colnames(info_sub))]
+})
+info = info %>%
+  mutate(index2 = as.character(index2),
+         idsequencing = as.character(idsequencing)) %>%
+  mutate(index2 = if_else(experiment=="topography", idsequencing, index2)) %>%
+  mutate(index2 = if_else(experiment=="ulman", "71", index2))
+info = info %>% mutate(id2 = paste(index2, index1, sep="_")) %>%
+  mutate(barcode = paste0("bc", barcode)) %>%
+  mutate(id3 = paste(id2, barcode, sep="_")) 
+```
+
+```{r}
+info = info %>% mutate(position = sub("[a-z]+_", "", position))
+info = info %>% mutate(position = if_else(position=="cm", "meso", position)) %>%
+  mutate(position2 = if_else(position=="fieldl", "nido", position2)) %>%
+  mutate(condition = paste(procedure2, duration.of.experiment, sep="_"))
+
+info = info %>% mutate(age = if_else(age==0, 365L, age))
+```
+
+```{r}
+info_filt = info %>%
+  filter(position %in% c("ra", "arco", "hvc", "ncl", "lman", "nido", "x", "stri")) %>% 
+  filter(experiment=="deafening") %>% 
+  filter(index2 %in% c("53", "54", "56")) %>% 
+  filter(index1 %in% indices_cur$index1) %>%
+  mutate(seq_date2 = gsub("-", "", seq_date),
+         seq_date2 = sub("20", "", seq_date2)) %>%
+   mutate(seq_date2 = if_else(seq_date2=="180911", "180913", seq_date2)) # some error in seq_date labeling
+
+info_filt1 = info_filt %>% distinct(index2, index1, pool, seq_date2)
+```
+
+```{r}
+info_red = info_filt %>%
+  select(id, barcode, index1, index2,  id2, procedure2, tags, position, experiment)
+```
+
+## Combine data
+```{r}
+#seq_cur = "53"
+res_mats1 = map(seq_along(res_mats), function(i) {
+  date_cur = names(res_mats)[i]
+  res_mat_cur = res_mats[[i]]
+  pools_cur = 1:length(res_mat_cur)
+  map(seq_along(res_mat_cur), function(j) {
+    res_mat_cur2 = res_mat_cur[[j]]
+    pool_cur = pools_cur[j]  
+
+    info_filt1_cur = info_filt1 %>%
+      filter(pool==pool_cur, seq_date2==date_cur)
+    seq_cur = info_filt1_cur$index2
+    index_cur = info_filt1_cur$index1
+    #res_mat = res_mat_cur[[i]]
+    colnames(res_mat_cur2) = paste(seq_cur, index_cur, colnames(res_mat_cur2), sep="_")
+    res_mat_cur2
+  })
+})
+res_mats1 = unlist(res_mats1, recursive = F)
+res_mat = do.call(cbind, res_mats1)
+#res_mat1 = res_mat
+
+res_mat = res_mat[,intersect(colnames(res_mat), info_filt$id3)]
+colnames(res_mat) = info_filt$id[match(colnames(res_mat), info_filt$id3)]
+```
+
+```{r}
+#ids = intersect(info_filt$id, colnames(res_mat))
+ids = colnames(res_mat)
+info_filt = info_filt[match(ids, info_filt$id),]
+info_filt = as.data.frame(info_filt)
+rownames(info_filt) = info_filt$id
+#info_filt = info_filt %>% column_to_rownames(var="id")
+res_mat_order = res_mat[,ids]
+
+obj = CreateSeuratObject(counts = res_mat_order, meta.data=info_filt)
+#se = SummarizedExperiment(assays=list(counts=res_mat_order), colData=info_filt)
+```
+  ### Sample stats
+
+```{r}
+data_summary = FetchData(obj, c("nCount_RNA", "position", "lib_column", "lib_row", "tags", "barcode", "index1", "id2", "brain_side"))
+
+data_summary %>% 
+  summarize(unique_umi_mean = mean(nCount_RNA),
+            unique_umi_median = median(nCount_RNA))
+
+dat_sum = data_summary %>% 
+  group_by(position) %>% 
+  summarize(unique_umi_mean = mean(nCount_RNA),
+            unique_umi_median = median(nCount_RNA))
+
+write_delim(dat_sum, file.path(out_dir, "umi_stats.txt"), delim="\t")
+```
+
+
+```{r}
+#bad_indices = c(705, 716, 718, 720)
+```
+
+
+
+```{r}
+
+gg = ggplot(data_summary, aes(factor(lib_column), log10(nCount_RNA), color=tags))
+gg = gg + geom_point(position=position_jitter(width=.2), alpha=1) 
+gg = gg + facet_wrap(~position)
+#gg = gg + geom_hline(yintercept=2000)
+gg
+ggsave(file.path(figures_dir, "umi_by_lib_column.pdf"), height=8, width=8)
+```
+
+
+```{r}
+gg = ggplot(data_summary, aes(factor(lib_row), log10(nCount_RNA)))
+gg = gg + geom_point(position=position_jitter(width=.2), alpha=.1) 
+gg = gg + facet_wrap(~position)
+#gg = gg + geom_hline(yintercept=2000)
+gg
+ggsave(file.path(figures_dir, "umi_by_lib_row.pdf"), height=8, width=8)
+```
+
+
+```{r}
+gg = ggplot(data_summary, aes(tags, log10(nCount_RNA), color=brain_side)) +
+  geom_point(position=position_jitter(width=.2), alpha=1) +
+  facet_wrap(~position)
+gg = gg + theme_bw()
+gg = gg + theme(axis.text.x=element_text(angle=45, hjust=1))
+#gg = gg + labs(x="Duration of experiment")
+gg
+ggsave(file.path(figures_dir, "umi_by_tags.pdf"), height=8, width=8)
+```
+
+
+#### Unique umi totals - heatmap
+```{r}
+#tmp = data_summary %>% group_by(id2, barcode) %>%
+#  summarize(nCount_RNA=sum(nCount_RNA))
+tmp2 = data_summary
+tmp2$barcode = as.numeric(sub("bc", "", as.character(tmp2$barcode)))
+
+ggplot(tmp2, aes(barcode, id2, fill=log10(nCount_RNA))) + geom_tile() + scale_fill_viridis()
+ggsave(file.path(figures_dir, "nCount_RNA_heatmap.pdf"), height=12, width=12)
+```
+
+## Remove bad barcodes
+```{r}
+cells = Cells(obj)[obj$barcode != "bc11"]
+obj = subset(obj, cells=cells )
+```
+
+### Calculate fraction mito
+```{r}
+tx = import("~/data2/assembly/lonStrDom2/ncbi/GCF_005870125.1_lonStrDom2_genomic.gtf")
+tx_mt = tx[seqnames(tx)=="NC_029475.1"]
+
+t2g = read_delim("/mnt/hugin/assembly/lonStrDom2/ncbi/GCF_005870125.1_lonStrDom2_genomic.t2g", delim="\t", col_names= c("transcript_id", "gene_id", "gene"))
+t2g_mt = t2g %>% 
+  
+  mutate(transcript_id = sub("rna-|gene-", "", transcript_id),
+         gene_id =  sub("rna-|gene-", "", gene_id)) %>%
+  mutate(gene_id2 = if_else(grepl("nbis", gene_id), transcript_id, gene_id)) %>%
+  filter(gene_id2 %in% tx_mt$gene_id)
+
+
+gene_ids = rownames(res_mat)
+gene_id_mt = intersect(gene_ids, t2g_mt$gene_id)
+gene_id_mt = sub("_", "-", gene_id_mt)
+
+obj$frac_mito = PercentageFeatureSet(obj, features = gene_id_mt) / 100
+
+```
+
+
+```{r}
+info = obj@meta.data
+
+gg = ggplot(info, aes(frac_mito)) +
+  geom_density()
+gg
+
+gg = ggplot(info, aes(tags, frac_mito, color=procedure2))
+gg = gg + geom_point()
+gg = gg + facet_wrap(~position)
+gg = gg + theme(axis.text.x=element_text(angle=45, hjust = 1))
+gg
+save_plot(file.path(figures_dir, "frac_mito_by_tags_position.pdf"), gg, base_width = 2, base_height=2, ncol=3, nrow=2)
+
+gg = ggplot(info, aes(procedure2, frac_mito))
+gg = gg + geom_point(position=position_jitter(.2))
+gg = gg + facet_wrap(~position)
+gg = gg + theme(axis.text.x=element_text(angle=45, hjust = 1))
+gg = gg + geom_hline(yintercept=0.5, color="red")
+gg = gg + geom_hline(yintercept=0.4, color="red")
+
+gg
+save_plot(file.path(figures_dir, "frac_mito_by_condition_position.pdf"), gg, base_width = 2, base_height=2, ncol=3, nrow=2)
+```
+
+```{r}
+gg = ggplot(info, aes(section_area, frac_mito))
+gg = gg + geom_point()
+gg = gg + stat_smooth()
+gg
+save_plot(file.path(figures_dir, "frac_mito_vs_section_area.pdf"), gg, base_height=4, base_aspect_ratio = 1.1)
+```
+Moderate association between section_area and frac_mito
+
+### Calculate CDR and filter out low CDR samples
+
+```{r}
+obj$cdr = obj$nFeature_RNA / nrow(obj)
+info = obj@meta.data
+gg = ggplot(info, aes(cdr))
+gg = gg + geom_density()
+gg = gg + facet_wrap(~position)
+gg
+
+gg = ggplot(info, aes(cdr)) +
+ geom_density()
+gg
+```
+
+```{r}
+obj = obj[,obj$cdr>.2]
+```
+
+## Filter out MT genes
+```{r}
+genes_to_use = rownames(obj)
+genes_to_use = genes_to_use[!(genes_to_use %in% gene_id_mt)]
+#se = se[genes_to_use,]
+
+obj = obj[genes_to_use,]
+```
+
+## Remove lowly expressed genes
+```{r}
+dat = GetAssayData(obj, slot = "counts", assay="RNA")
+ind = rowSums(dat > 1) >= (ncol(dat) / 8)
+obj = obj[ind,]
+```
+
+## Normalize
+```{r}
+dat = GetAssayData(obj, assay="RNA", slot="counts")
+dge = DGEList(counts=dat, samples=obj@meta.data)
+dge = calcNormFactors(dge,method =c("TMMwsp"))
+dat_norm = edgeR::cpm(dge, prior.count=1, log=T)
+
+obj = SetAssayData(obj, slot = "data", new.data = dat_norm, assay = "RNA")
+#assays(se)[["edger_norm"]] = dat_norm
+```
+
+```{r}
+#obj = SCTransform(obj, vars.to.regress = "frac_mito")
+```
+
+
+## Impute artifactual high variance samples for each gene
+```{r}
+# library(DrImpute)
+# positions = unique(se$position)
+# 
+# thresh = 4
+# dat_filt = map(positions, function(p) {
+#   print(p)
+#   se_cur = se[,se$position == p]
+#   dat_norm_cur = assay(se_cur, "edger_norm")
+#   dat_cur = assay(se_cur, "counts")
+#   dat_cur_scaled = abs(t(apply(dat_cur, 1, scale)))
+#   dat_cur[dat_cur_scaled>thresh] = 0
+#   dat_cur_log = as.matrix(log1p(dat_cur))
+#   dat_cur_imp = DrImpute(dat_cur_log)
+#   colnames(dat_cur_imp) = colnames(dat_cur)
+#   exp(dat_cur_imp) - 1
+# })
+# 
+# dat_imp = do.call(cbind, dat_filt)
+# dat_imp = dat_imp[,match(se$id, colnames(dat_imp))]
+# assays(se)[["imputed"]] = dat_imp
+# 
+# dge = DGEList(counts=dat_imp, samples=colData(se))
+# dge = calcNormFactors(dge,method =c("TMMwsp"))
+# dat_norm = edgeR::cpm(dge, prior.count=1, log=T)
+# assays(se)[["imputed_norm"]] = dat_norm
+```
+
+### Batch correct
+```{r}
+redo = F
+#combat1_fname = file.path(prefix, "combat1.rds")
+
+positions = na.omit(unique(obj$position))
+mags1 = map(as.character(positions), function(p) {
+  print(p)
+  obj_cur = obj[,obj$position==p]
+  dat_cur = GetAssayData(obj_cur, "data", "RNA")
+  info_cur = obj_cur@meta.data
+  
+  mod = model.matrix(~ procedure2, info_cur)
+  dat_cur_comb = ComBat(dat_cur,  batch = info_cur$id2, mod=mod)
+
+  dat_cur_comb
+})
+mags1 = do.call(cbind, mags1)
+mags1 = mags1[,match(Cells(obj), colnames(mags1))]
+
+mags1_obj = CreateAssayObject(data=mags1)
+
+obj[["combat_id2"]] = mags1_obj
+```
+
+### Example genes
+```{r}
+obj$position = factor(obj$position, levels=position_levels)
+obj$position_pretty =  factor(obj$position_pretty, levels=position_pretty_levels)
+```
+
+```{r}
+
+tp = c("PCP4", "NTS", "NPY", "RGS12", "CORT", "CRHBP", "LRRC4B", "ETV1", "SIX2")
+obj_cur = obj[tp,]
+cd = obj_cur@meta.data %>%
+  select(position, index1, id, tags, barcode) %>%
+  mutate(id = as.character(id))
+mags = GetAssayData(obj_cur, assay = "RNA", slot="data") %>% as.data.frame() %>% rownames_to_column(var="gene_id") %>%
+  pivot_longer(cols=-gene_id, names_to="id")
+
+mags1 =  GetAssayData(obj_cur, assay = "combat_id2", slot="data")  %>% as.data.frame() %>% rownames_to_column(var="gene_id") %>%
+  pivot_longer(cols=-gene_id, names_to="id", values_to = "value_combat")
+
+mags = mags %>% left_join(mags1)
+mags = mags %>% left_join(cd)
+
+gg = ggplot(mags %>% 
+         filter(gene_id %in% tp), aes(position, value, color=index1)) + geom_point(position=position_jitterdodge(jitter.width=.2, dodge.width=.4), alpha=1/4) 
+gg = gg + facet_wrap(~gene_id)
+gg
+
+gg = ggplot(mags %>% 
+         filter(gene_id %in% tp), aes(position, value, color=tags)) + geom_point(position=position_jitterdodge(jitter.width=.2, dodge.width=.4), alpha=1/4) 
+gg = gg + facet_wrap(~gene_id)
+gg
+
+gg = ggplot(mags %>% 
+         filter(gene_id %in% tp), aes(position, value, color=barcode)) + geom_point(position=position_jitterdodge(jitter.width=.2, dodge.width=.4), alpha=1/4) 
+gg = gg + facet_wrap(~gene_id)
+gg
+
+
+
+
+gg = ggplot(mags %>% 
+         filter(gene_id %in% tp), aes(position, value_combat, color=index1)) + geom_point(position=position_jitterdodge(jitter.width=.2, dodge.width=.4), alpha=1/4) 
+gg = gg + facet_wrap(~gene_id)
+gg
+```
+## Reassign position labels
+RA markers
+```{r}
+markers = list(ra =  c("PVALB", "NDNF", "SIX2", "SLIT1"),
+               hvc = c("PVALB", "GFRA1", "NEFM", "AR"),
+               lman = c("CALCB","LGALS1", "CACNA1D", "FOXP1", "NTSR1"),
+               x=c("CNTN4", "CACNB4", "HTR1B"))
+
+pair = c(ra = "arco", hvc = "ncl", lman = "nido", x = "stri")
+walk(seq_along(markers), function(i) {
+  p = names(markers)[i]
+  print(p)
+  p2 = pair[p]
+  tp = markers[[i]]
+  tp = intersect(rownames(obj), tp)
+  obj_cur = obj[tp,]
+  cd = obj_cur@meta.data %>%
+    select(position, index1, id, tags, barcode) %>%
+    mutate(id = as.character(id))
+  mags = GetAssayData(obj_cur, assay = "RNA", slot="data") %>% as.data.frame() %>% rownames_to_column(var="gene_id") %>%
+    pivot_longer(cols=-gene_id, names_to="id") 
+  
+  #mags = mags %>% left_join(mags1)
+  mags = mags %>% left_join(cd) %>%
+    filter(position %in% c(p, p2))
+  
+  gg = ggplot(mags %>% 
+                filter(gene_id %in% tp), aes(id, value, color=tags)) + geom_point(position=position_jitterdodge(jitter.width=.2, dodge.width=.4), alpha=1) 
+  gg = gg + facet_grid(gene_id~position)
+  print(gg)
+})
+```
+HVC filter
+```{r}
+genes_to_thresh = c("NEFM", "PVALB")
+obj_cur = obj[genes_to_thresh,]
+cd = obj_cur@meta.data %>%
+  select(position, index1, id, tags, barcode) %>%
+  mutate(id = as.character(id))
+mags = GetAssayData(obj_cur, assay = "RNA", slot="data") %>% as.data.frame() %>% rownames_to_column(var="gene_id") %>%
+  pivot_longer(cols=-gene_id, names_to="id") 
+
+#mags = mags %>% left_join(mags1)
+mags = mags %>% left_join(cd)
+
+
+mags_surround = mags %>%
+  filter(position=="ncl") %>%
+  filter(gene_id %in% genes_to_thresh) %>%
+  group_by(gene_id) %>%
+  summarize(value_mean = mean(value),
+            value_sd = sd(value),
+            value_z1 = value_mean + value_sd)
+mags_song = mags %>%
+  filter(position == "hvc") %>%
+  left_join(mags_surround) %>%
+  filter(value<value_mean) %>%
+  distinct(id)
+```
+
+```{r}
+md = FetchData(obj, c("position", "id", "tags"))
+md_new = md %>% 
+  mutate(position = if_else(id %in% mags_song$id, "ncl", as.character(position))) %>%
+  mutate(position = factor(position, levels=position_levels))
+
+table(md[,c("position", "tags")])
+table(md_new[,c("position", "tags")])
+
+obj = AddMetaData(obj, md_new)
+```
+
+LMAN filter
+```{r}
+genes_to_thresh = c("CALCB", "LGALS1")
+obj_cur = obj[genes_to_thresh,]
+cd = obj_cur@meta.data %>%
+  select(position, index1, id, tags, barcode) %>%
+  mutate(id = as.character(id))
+mags = GetAssayData(obj_cur, assay = "RNA", slot="data") %>% as.data.frame() %>% rownames_to_column(var="gene_id") %>%
+  pivot_longer(cols=-gene_id, names_to="id") 
+
+#mags = mags %>% left_join(mags1)
+mags = mags %>% left_join(cd)
+
+
+mags_nido = mags %>%
+  filter(position=="nido") %>%
+  filter(gene_id %in% genes_to_thresh) %>%
+  group_by(gene_id) %>%
+  summarize(value_mean = mean(value),
+            value_sd = sd(value),
+            value_z1 = value_mean + value_sd)
+mags_lman = mags %>%
+  filter(position == "lman") %>%
+  left_join(mags_nido) %>%
+  filter(value<value_mean) %>%
+  distinct(id)
+```
+
+```{r}
+md = FetchData(obj, c("position", "id"))
+md_new = md %>% 
+  mutate(position = if_else(id %in% mags_lman$id, "nido", as.character(position)))
+
+table(md$position)
+table(md_new$position)
+
+obj = AddMetaData(obj, md_new)
+```
+
+
+```{r}
+# 
+# gene_to_test = "NCKAP1"
+# a = colnames(se)[assay(se, "edger_norm")[gene_to_test,]>14]
+# cd = colData(se) %>% as.data.frame() %>% filter(id %in% a)
+# 
+# 
+# se_test = assay(se, "edger_norm")[gene_to_test,]
+# se_test[se$barcode =="bc10"]
+# 
+# se_test_scale = scale(se_test)
+# se_test_scale[a,]
+# 
+# nf = dge$samples$norm.factors
+# names(nf) = colnames(se)
+# nf[a]
+# 
+# 
+# b = assay(se, "edger_norm")[gene_to_test, setdiff(colnames(se), a)]
+# LogVMR(b)
+```
+
+# Sample visualization
+
+
+```{r}
+dims_use = 1:40
+obj = FindVariableFeatures(obj, assay = "RNA")
+obj = obj %>%
+  ScaleData(vars.to.regress = "cdr") %>%
+  RunPCA(dims=dims_use) %>%
+  RunUMAP(dims=dims_use)
+```
+
+```{r}
+color_vars_discrete = c("position", "tags", "brain_side", "procedure2", "lib_column", "lib_row")
+walk(color_vars_discrete, function(v) {
+  gg = DimPlot(obj, reduction="umap", group.by=v)
+  print(gg)
+  save_plot(file.path(figures_dir, sprintf("umap_%s.pdf", v)), gg, base_height=3)
+})
+
+color_vars_cont = c("cdr", "frac_mito")
+walk(color_vars_cont, function(v) {
+  gg = FeaturePlot(obj, reduction="umap", features=v)
+  print(gg)
+  save_plot(file.path(figures_dir, sprintf("umap_%s.pdf", v)), gg, base_height=3)
+})
+```
+
+### Write out data
+```{r}
+qsave(obj, file.path(out_dir, "seurat_object.qs"))
+```
+
+## Export flat files
+```{r}
+dat = as.matrix(GetAssayData(obj, slot="counts"))
+dat_fname = file.path(prefix_cur, "dat_filtered.csv")
+write.table(dat, file = dat_fname, quote=F, sep=",", row.names=T, col.names=T )
+dat_test = read.csv(dat_fname)
+```
+
+```{r}
+md_fname = file.path(prefix_cur, "metadata.csv")
+
+to_include = c("id", "nCount_RNA", "nFeature_RNA", "date_prepared", "collection.time", "minutes_until_frozen", "date.of.surgery",  "tags", "dob", "nest", "sex", "bird.age", "reference", "um_from_reference", "position", "songsystem", "section_area", "lib_plate", "lib_row", "lib_column", "barcode", "pool", "index1", "index2", "procedure2", "duration.of.experiment", "last_song_datetime", "minutes_from_last_song", "num_songs_on_euth_date", "first_song_datetime", "nsongs_per_day_pre", "frac_mito", "cdr", "kl_mean", "kl_mean_log_scale_cut2_proc2")
+md = obj@meta.data
+md_select = md %>% select(one_of(to_include))
+write.table(md_select, md_fname, quote=F, sep=",", col.names=T, row.names=F)
+```
+
+```{r}
+md$pool_index2 = paste(md$pool, md$index2, sep="_")
+md_id = split(md$id, md$pool_index2)
+```
+
+
+
+
+
+## Hierarchical clustering
+```{r}
+library(ggdendro)
+library(flashClust)
+source("~/data2/rstudio/birds/utils/ggplot.R")
+source("~/data2/rstudio/birds/utils/mixed_model2.R")
+```
+
+```{r}
+# ids = mags %>% ungroup() %>% 
+#         filter(!(id %in% to_exclude)) %>%
+#   distinct(id) %>% unlist()
+# 
+# mean_filter = .80
+# mags1_means = apply(mags2, 1, mean)
+# q = quantile(mags1_means, mean_filter)
+# 
+# to_hc =  list(mags2[mags1_means>q,colnames(mags2) %in% ids])
+
+```
+
+```{r}
+# hcs = lapply(1:length(to_hc), function(i) {
+#   print(i)
+#   x = to_hc[[i]]
+#   d = dist(t(x), method = "correlation")
+#   hc = flashClust::hclust(d, method = "ward")
+#   hc
+# })
+# 
+# ddatas = lapply(1:length(to_hc), function(i) {
+#   print(i)
+#   hc = hcs[[i]]
+#   dhc <- as.dendrogram(hc)
+#   ddata <- dendro_data(dhc, type = "rectangle")
+#   colnames(ddata$labels)[3] = "tags_position"
+#   ddata$labels = merge(ddata$labels, info)
+#   ddata$value = names(to_hc)[i]
+#   ddata
+# })
+# names(ddatas) = names(to_hc)
+```
+
+```{r}
+# library(dendextend)
+# library(circlize)
+``` 
+
+```{r}
+# hc1 = hcs[[1]]
+# dend = as.dendrogram(hc1) 
+# dend_labels = dend %>% labels
+# positions = as.character(info$position[match(dend_labels, info$id)])
+# colors = position_colors[positions]
+# dend = dend %>% 
+#   color_labels(labels=dend_labels, col=colors) %>%
+#   set("leaves_pch", 19) %>%
+#   set("leaves_col", colors) %>%
+#   set("leaves_cex", 1.5)
+```
+
+```{r}
+# circlize_dendrogram(dend, labels=F, dend_track_height = .75 )
+```
+
+```{r}
+# plot_circular_dendro = function() {
+#   nleaves = length(dend_labels)
+#   circos.initialize("foo", xlim = c(0, nleaves))
+#   
+  # ## Tags track 
+  # tags = info$tags[match(dend_labels, info$id)]
+  # tags_color = brewer.pal(length(unique(tags)), name = "Dark2")
+  # names(tags_color) = unique(tags)
+  #  circos.track(ylim = c(0, 1), panel.fun = function(x, y) {
+  #   xlim = get.cell.meta.data("xlim")
+  #   print(xlim)
+  #   circos.rect(1:nleaves - .9,
+  #               rep(0, nleaves),
+  #               1:nleaves - 0.1,
+  #               rep(1, nleaves),
+  #               col = tags_color[tags],
+  #               border = NA)
+  # }, bg.border = NA,
+  # track.height=.2)
+   
+  ## Position track
+#   circos.track(ylim = c(0, 1), panel.fun = function(x, y) {
+#     xlim = get.cell.meta.data("xlim")
+#     print(xlim)
+#     circos.rect(1:nleaves - .9,
+#                 rep(0, nleaves),
+#                 1:nleaves - 0.1,
+#                 rep(1, nleaves),
+#                 col = colors,
+#                 border = NA)
+#   }, bg.border = NA,
+#   track.height=.2)
+#   
+#   max_height = attr(dend, "height")
+#   dend1 = dend %>% set("leaves_col", NA)
+#   circos.track(ylim = c(0, max_height), panel.fun = function(x, y) {
+#     circos.dendrogram(dend1, max_height = max_height)
+#   }, track.height = 0.5, bg.border = NA)
+#   
+# }
+# plot_circular_dendro()
+```
+
+```{r}
+# cairo_pdf(file.path(prefix, "figures", "hclust_circular.pdf"), height=8, width=8)
+# plot_circular_dendro()
+# dev.off()
+```

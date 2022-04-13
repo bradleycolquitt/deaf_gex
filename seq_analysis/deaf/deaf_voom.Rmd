@@ -1,0 +1,1301 @@
+```{r}
+
+#source("~/data2/rstudio/birds/utils/seq_analysis.R")
+#source("~/data2/rstudio/birds/utils/colors.R")
+#source("~/data2/rstudio/birds/utils/network.R")
+#source("~/data2/rstudio/birds/utils/db.R")
+#source("~/data2/rstudio/birds/utils/stats.R")
+#source("~/data2/rstudio/birds/utils/scde.R")
+
+#source("~/data2/rstudio/birds/utils/scRNA.R")
+library(tidyverse)
+library(qs)
+library(Seurat)
+library(reshape2)
+#library(viridis)
+#library(RColorBrewer)
+library(future)
+library(limma)
+library(edgeR)
+library(sva)
+library(fgsea)
+library(furrr)
+library(flextable)
+#library(proxy)
+library(ggrepel)
+library(cowplot)
+
+library(egg)
+#library(Biostrings)
+#library(BiocParallel)
+#library(SummarizedExperiment)
+library(ComplexHeatmap)
+library(circlize)
+#library(scales)
+
+#library(ggrastr)
+
+#filter = dplyr::filter
+#rename = dplyr::rename
+#select = dplyr::select
+```
+
+## Set up dir
+```{r}
+#prefix_song = "~/data2/rstudio/birds/singing/song_analysis"
+base_dir = "~/data2/rstudio/birds" ## to change
+prefix = file.path(base_dir, "deaf_gex/seq_analysis/deaf")
+prefix_data = file.path(prefix, "data")
+script_name = "deaf_voom"
+prefix_cur = file.path(prefix, script_name)
+dir.create(prefix_cur, recursive = T)
+```
+```{r}
+util_dir = file.path(base_dir, "deaf_gex/seq_analysis/utils")
+source(file.path(util_dir, "common_aesthetics.R"))
+```
+
+## Function def
+
+```{r}
+run_fit = function(se, design_char, blocking) {
+  
+  info_df1 = se@meta.data
+  info_df1 = droplevels(info_df1)
+  
+  dat_cur = GetAssayData(se, "counts", assay="RNA")
+  dge = DGEList(dat_cur)
+  
+  ### Filter genes
+  to_keep = filterByExpr(dge, group = info_df1[,blocking])
+  sprintf("Num genes to keep: %s", sum(to_keep))
+  dge = dge[to_keep,]
+  
+  dge = calcNormFactors(dge,method =c("TMMwsp"))
+  
+  ### FIT 
+  design = model.matrix(as.formula(design_char), info_df1)
+  colnames(design) = make.names(colnames(design))
+  print(colnames(design))
+  v1 = voom(dge,design,plot=F, normalize.method=normalize.method)
+  corfit = duplicateCorrelation(v1, design, block = info_df1[,blocking])
+  fit = lmFit(v1, design, block = info_df1[,blocking], correlation =
+                corfit$consensus.correlation)
+  return(fit)
+}
+```
+
+## Load object
+```{r}
+se_fname = file.path(prefix_data, "seurat_object.qs")
+se1 = qread(se_fname)
+```
+
+## Load coefs
+
+```{r}
+model_fname = file.path(prefix_data, "coefs.rds")
+se_coefs = readRDS(model_fname)
+```
+
+```{r}
+loc_trans = read_delim(file.path(prefix_data, "GCF_005870125.1_lonStrDom2_genomic_loc_synonyms.txt"), delim="\t")
+```
+
+## Gene filter
+Remove genes that have similar expression variation across individuals and regions -- likely influenced by technical artifact
+```{r}
+
+redo = T
+gene_var_fname = file.path(prefix_data, "gene_variance_stats.rds")
+if (redo) {
+  dat = GetAssayData(se1, assay = "RNA", slot="data")
+  
+  md = FetchData(se1, c("set", "duration.of.experiment", "procedure2", "tags", "position", "index2", "nCount_RNA")) %>%
+    rownames_to_column("id")
+  
+  dat_df_full = dat %>% as.data.frame %>% rownames_to_column(var="gene_id") %>% 
+    pivot_longer(-gene_id, names_to="id", values_to="value") %>% 
+    left_join(md) %>% 
+    mutate(set= factor(set))
+  
+  dat_df_avg = dat_df_full %>% group_by(gene_id, position, tags) %>% 
+    summarize(value=mean(value)) %>%
+    ungroup() 
+  
+  dat_df_var = dat_df_avg %>%
+    group_by(tags, gene_id) %>%
+    summarize(value_var_pos = LogVMR(value))  %>%
+    group_by(gene_id) %>%
+    summarize(value_var_pos_mean = mean(value_var_pos))
+  
+  
+  dat_df_var2 = dat_df_avg %>%
+    group_by(position, gene_id) %>%
+    summarize(value_var_tags = LogVMR(value)) %>%
+    ungroup() %>%
+    group_by(gene_id) %>%
+    summarize(value_var_tags_mean = mean(value_var_tags))
+  
+  dat_df_stat = dat_df_var %>% left_join(dat_df_var2)
+  mod = lm(value_var_pos_mean ~ value_var_tags_mean, dat_df_stat)
+  dat_df_stat$resid = residuals(mod)
+  saveRDS(dat_df_stat, gene_var_fname)
+} else {
+  dat_df_stat = readRDS(gene_var_fname)
+}
+```
+
+```{r}
+thresh_pos = .3
+thresh_tags = 1
+thresh_resid = -1
+gg = ggplot(dat_df_stat, aes(value_var_tags_mean, resid)) + 
+  geom_point() + 
+  geom_hline(yintercept=thresh_resid)
+gg
+
+dat_df_stat_thresh = dat_df_stat %>%
+  filter(resid > thresh_resid)
+```
+
+```{r}
+se1 = se1[dat_df_stat_thresh$gene_id,]
+```
+
+## Transformations
+```{r}
+md = se1@meta.data %>% 
+  rownames_to_column() %>%
+  select(-nsongs_per_day_pre_scale) # from earlier calculation, replacing here
+
+md_tags = md %>%
+  distinct(tags, num_songs_on_euth_date, kl_mean, nsongs_per_day_pre, procedure2, duration.of.experiment) %>%
+  mutate(num_songs_on_euth_date_log = log1p(num_songs_on_euth_date),
+         num_songs_on_euth_date_log_mean = mean(num_songs_on_euth_date_log),
+         num_songs_on_euth_date_log_sd = sd(num_songs_on_euth_date_log),
+         num_songs_on_euth_date_log_scale = (num_songs_on_euth_date_log - num_songs_on_euth_date_log_mean) / num_songs_on_euth_date_log_sd,
+      
+         nsongs_per_day_pre = if_else(is.na(nsongs_per_day_pre), mean(nsongs_per_day_pre, na.rm=T), nsongs_per_day_pre),
+         nsongs_per_day_pre_log = log1p(nsongs_per_day_pre),
+         nsongs_per_day_pre_log_sd = sd(nsongs_per_day_pre_log),
+         nsongs_per_day_pre_log_scale = (nsongs_per_day_pre_log - mean(nsongs_per_day_pre_log)) / nsongs_per_day_pre_log_sd ,
+
+         kl_mean_log = log(kl_mean + .1),
+         kl_mean_log_scale_cut2_proc2 = cut(kl_mean_log, breaks=c(-3, -1.3, -.65, 2), labels=F),
+         kl_mean_log_scale_cut2_proc2 = paste(procedure2, kl_mean_log_scale_cut2_proc2, sep="-"),
+         kl_mean_log_scale_cut2_proc2 = factor(kl_mean_log_scale_cut2_proc2, levels=c("intact-1", "intact-2", "deaf-2", "deaf-3"))
+  )
+```
+
+```{r}
+gg= ggplot(md_tags, aes(procedure2, kl_mean_log, color=factor(duration.of.experiment))) + 
+  geom_point(position=position_jitter(width = .2)) + 
+  geom_hline(yintercept=-.65) + 
+  geom_hline(yintercept=-1.3)
+gg
+```
+
+```{r}
+table(md_tags %>% select(procedure2, kl_mean_log_scale_cut2_proc2))
+
+md = md %>% 
+  select(-num_songs_on_euth_date, -kl_mean, -nsongs_per_day_pre) %>%
+  left_join(md_tags) %>%
+  mutate(frac_mito_scale = scale(frac_mito),
+         tags_position = paste(tags, position, sep="-")) %>%
+  column_to_rownames()
+
+se1 = AddMetaData(se1, md)
+
+#333se1$index2_pool = paste(se1$index2, se1$pool, sep="-")
+```
+
+## SVA
+```{r}
+sv_dir = file.path(prefix_cur, "sva")
+dir.create(sv_dir)
+sv_fname = file.path(sv_dir, "sva.rds")
+vp_fname = file.path(sv_dir, "vp.rds")
+
+dat = as.matrix(GetAssayData(se1, slot = "counts"))
+  
+redo = T
+if (redo) {
+  
+
+  
+  des_char ="~0 + position +
+position:num_songs_on_euth_date_log_scale +
+position:kl_mean_log_scale_cut2_proc2 +
+position:kl_mean_log_scale_cut2_proc2:num_songs_on_euth_date_log_scale + 
+position:nsongs_per_day_pre_log_scale + 
+cdr_scaled + frac_mito_scale"
+  
+  des_char0 = "~0 + position +
+cdr_scaled + frac_mito_scale"
+  
+  mod = model.matrix(as.formula(des_char), se1@meta.data)
+  mod0 = model.matrix(as.formula(des_char0), se1@meta.data)
+  n.sv = num.sv(dat,mod,method="leek")
+  n.sv
+  
+  svobj = svaseq(dat, mod, mod0)
+  sv = svobj$sv
+  rownames(sv) = colnames(se1)
+  colnames(sv) = paste0("sv", 1:ncol(sv))
+  saveRDS(sv, sv_fname)
+  
+} else {
+  sv = readRDS(sv_fname)
+}
+
+redo_vp = T
+if (redo_vp) {
+  ## Variance partition
+  library(variancePartition)
+  dat_cur = dat
+  to_use = rowSums(cpm(dat_cur)>1) >=0.5 * ncol(dat_cur)
+  dat_cur1 = dat_cur[to_use,]
+  
+  info = as.data.frame(cbind(se1@meta.data, sv))
+  info = info %>%
+    mutate(lib_column = factor(lib_column),
+           set = factor(set))
+  gExpr = DGEList(counts=dat_cur1)
+  gExpr = calcNormFactors(gExpr, method = "TMMwsp")
+  
+  design = model.matrix( ~ 1, info)
+  vobjGenes = voom(gExpr, design )
+  
+  param = SnowParam(workers = 10, type = "SOCK")
+  
+  form = ~ cdr_scaled + frac_mito_scale + sv1 + sv2 + sv3 + sv4 + sv5 + sv6 + sv7 + sv8 + sv9 + sv10 + (1|lib_column) + (1|set) + (1|index2_pool) +
+    (1|position)
+  varPart = fitExtractVarPartModel(vobjGenes, form, info, BPPARAM = param )
+  
+  saveRDS(varPart, vp_fname)
+} else {
+  varPart = readRDS(vp_fname)
+}
+
+vp = sortCols( varPart )
+plotPercentBars( vp[c("CRHBP", "SST", "EGR1", "SLC17A6"),] )
+gg = plotVarPart( vp )
+gg
+save_plot(file.path(sv_dir, "variancePartition_variance.pdf"), gg)
+
+vp %>% as.data.frame() %>% rownames_to_column() %>%
+  pivot_longer(-rowname) %>%
+  group_by(name) %>%
+  summarize(value_median = median(value),
+            value_mean = mean(value),
+            value_n = sum(value>.1)) %>%
+  arrange(desc(value_n))
+
+se1 = AddMetaData(se1, as.data.frame(sv))
+```
+
+
+## Model
+
+```{r}
+redo = F
+
+max_sv = 2
+
+outdir1 = file.path(prefix_cur, sprintf("sv%s", max_sv))
+dir.create(outdir1)
+
+model_fname = file.path(outdir1, "fit.rds")
+formula_fname = file.path(outdir1, "formula.txt")         
+normalize.method="none"
+blocking="tags_position"
+
+se1_cur = se1
+
+des_char = "~0 + position +
+position:num_songs_on_euth_date_log_scale +
+position:kl_mean_log_scale_cut2_proc2 +
+position:kl_mean_log_scale_cut2_proc2:num_songs_on_euth_date_log_scale + 
+position:nsongs_per_day_pre_log_scale + 
+cdr_scaled + frac_mito_scale"
+
+if (max_sv > 0) {
+  svs = paste(paste0("sv", 1:max_sv), collapse=" + ")
+  des_char =paste(des_char, svs, sep=" + ")
+}
+
+if (redo) {
+  fit = run_fit(se1_cur, des_char, blocking)
+  saveRDS(fit, model_fname)
+  write_lines(des_char, file = formula_fname)
+} else {
+  fit = readRDS(model_fname)
+}
+
+```
+### Standard errors
+```{r}
+fit1 = eBayes(fit)
+coefs = fit1$coefficients[,-1]
+std_errors = sqrt(fit1$s2.post) * fit1$stdev.unscaled
+std_errors = std_errors[,-1]
+cd = data.frame(cn = colnames(coefs)) %>%
+  filter(grepl("position", cn)) %>% 
+  mutate(cn_s = map(cn, ~unlist(str_split(.x, "\\."))),
+         cn_s_len = map_int(cn_s, length)) %>%
+  filter(cn_s_len > 1) %>%
+  mutate(
+    position = map_chr(cn_s, 1),
+         position = sub("position", "", position),
+    coef_orig = sub("position[a-z]+\\.", "", cn))
+
+coefs = coefs[,cd$cn]
+std_errors = std_errors[,cd$cn]
+se_coefs = SummarizedExperiment(assays=list(coef=coefs, std_errors = std_errors), colData = cd)
+```
+
+## Reduced model -- LIKELY REMOVE
+```{r}
+# redo = T
+# 
+# outdir1 = file.path(prefix_cur, sprintf("sv%s", max_sv))
+# dir.create(outdir1)
+# 
+# model_fname = file.path(outdir1, "fit_drop-kl_mean.rds")
+# residuals_fname = file.path(outdir1, "seurat_drop-kl_mean_residuals.rds")
+# formula_fname = file.path(outdir1, "formula_drop-kl_mean.txt")
+# normalize.method="none"
+# blocking="tags_position"
+# 
+# se1_cur = se1
+# 
+# des_char = paste("~0 + position +
+# position:num_songs_on_euth_date_log_scale +
+# position:nsongs_per_day_pre_log_scale +
+# cdr_scaled + frac_mito_scale",  svs, sep=" + ")
+# 
+# 
+# if (redo) {
+#   fit_red = run_fit(se1_cur, des_char, blocking)
+#   saveRDS(fit_red, model_fname)
+#   write_lines(des_char, path = formula_fname)
+# } else {
+#   fit_red = readRDS(model_fname)
+# }
+# 
+# dat = GetAssayData(se1_cur)
+# dat = dat[rownames(dat) %in% rownames(fit_red$coefficients),]
+# res_mat = residuals(fit_red, dat)
+# 
+# res_ass = CreateAssayObject(data=res_mat)
+# se1_cur[["residuals"]] = res_ass
+# saveRDS(se1_cur, residuals_fname)
+```
+
+```{r}
+# 
+# to_plot = c("CRHBP", "CORT", "SST", "EPB41L1", "PBX1", "MAN1C1")
+# 
+# dat_m = melt(res_mat[to_plot,])
+# colnames(dat_m) = c("gene_id", "id", "value")
+# md = FetchData(se1_cur, c("kl_mean_log_scale_cut2_proc", "position", "procedure2", "tags")) %>%
+#   rownames_to_column("id") %>%
+#   mutate(id = as.numeric(id))
+# dat_m = dat_m %>% left_join(md)
+```
+
+```{r}
+# dat_m_sum = dat_m %>% group_by(kl_mean_log_scale_cut2_proc, position, tags, gene_id) %>%
+#   summarize(value_mean = mean(value),
+#             value_sem = sem(value))
+# gg = ggplot(dat_m_sum %>% filter(position=="ra"), aes(kl_mean_log_scale_cut2_proc, value_mean)) + 
+#   geom_point() +
+#   facet_wrap(~gene_id)
+# gg
+```
+
+## Contrasts
+
+```{r}
+outdir2 = file.path(outdir1, "by_position")
+dir.create(outdir2)
+results_fname = file.path(outdir2, "model_results.rds")
+redo = F
+
+positions = unique(se1_cur$position)
+if (redo) {
+  
+  design = fit$design
+  coefs_names = list(
+    kl_mean_2_hearing = c(
+      "position%s.kl_mean_log_scale_cut2_proc2intact.2"
+    ),
+    kl_mean_2_deaf = c(
+      "position%s.kl_mean_log_scale_cut2_proc2deaf.2"
+    ),
+    kl_mean_3 = c(
+      "position%s.kl_mean_log_scale_cut2_proc2deaf.3"
+    ),
+    num_songs_euth_date = c(
+      "position%s.num_songs_on_euth_date_log_scale"
+      
+    ),
+    num_songs_pre = c(
+      "position%s.nsongs_per_day_pre_log_scale"
+      
+    ),
+    inter = c(
+      "position%s.num_songs_on_euth_date_log_scale.kl_mean_log_scale_cut2_proc2deaf.3"
+    )
+  )
+  coefs_names_short = map(coefs_names, ~sub("position%s\\.", "", .x))
+  coefs_names_short = coefs_names_short[!grepl("aov", names(coefs_names_short))]
+  coefs_names_short_df = data.frame(coef_orig = unlist(coefs_names_short), coef = names(coefs_names_short))
+  res = map(positions, function(p) {
+    print(p)
+    map(coefs_names, function(co) {
+      print(co)
+      co_cur = sprintf(co, p)
+      fit2 = contrasts.fit(fit, coefficients = co_cur)   
+      fit2 = eBayes(fit2)
+      tt = topTable(fit2, p.value=1, number=nrow(se1), confint=T)
+      tt = as.data.frame(tt) %>% rownames_to_column(var="gene_id") %>%
+        select(gene_id, AveExpr, P.Value, adj.P.Val, one_of("F", "t", "logFC"))
+      tt
+    }) %>% set_names(names(coefs_names)) %>% bind_rows(.id="coef")
+  }) %>% set_names(positions) %>% bind_rows(.id="position")
+  
+  std_errors = assay(se_coefs, "std_errors")
+  std_errors_df = melt(std_errors)
+  colnames(std_errors_df) = c("gene_id", "cn", "std_error")
+  se_coefs_md = colData(se_coefs) %>% as.data.frame()
+  std_errors_df = std_errors_df %>% left_join(se_coefs_md) %>%
+    left_join(coefs_names_short_df)
+  res = res %>% left_join(std_errors_df %>% select(gene_id, position, coef, std_error))
+  res = res %>% mutate(position = factor(position, levels=position_levels))
+  saveRDS(res, results_fname)
+} else{
+  res = readRDS(results_fname)
+}
+```
+
+
+
+```{r}
+tab = res %>% filter(adj.P.Val<.1) %>% group_by(coef, position) %>%
+  summarize(n=n()) %>%
+  pivot_wider(names_from="coef", values_from="n") %>% arrange(position)
+
+ft = flextable(tab)
+ft
+save_as_html(ft, path = file.path(outdir2, "deg_table.html"))
+
+tab = res %>% filter(adj.P.Val<.1) %>% 
+  mutate(sign = sign(logFC)) %>%
+  group_by(coef, position, sign) %>%
+  summarize(n=n()) %>%
+  pivot_wider(names_from="coef", values_from="n") %>% arrange(position)
+
+ft = flextable(tab)
+ft
+
+save_as_html(ft, path = file.path(outdir2, "deg_table_signed.html"))
+
+```
+## Write out flat file
+```{r}
+flat_fname = file.path(outdir2, "voom_results.csv")
+write_csv(res, flat_fname)
+```
+
+## MA
+```{r}
+co ="kl_mean_3"
+p = "ra"
+res_cur = res %>%
+  filter(coef==co, position==p)
+
+gg = ggplot(res_cur, aes(AveExpr, logFC)) + 
+  geom_point()+ 
+  geom_hline(yintercept=0, color=2)
+gg
+```
+
+## Volcano
+
+```{r}
+volcano_dir = file.path(outdir2, "volcano")
+dir.create(volcano_dir)
+```
+
+
+```{r}
+params = list(list(co = "num_songs_euth_date", xvar = "logFC", ymax = 5, xlab = "log fold-change # songs on euthanasia date"),
+              list(co = "num_songs_pre", xvar = "logFC", ymax = 5, xlab = "log fold-change # songs on euthanasia date"),
+              list(co = "kl_mean_3", xvar = "logFC", ymax = 5, xlab = "log fold-change mean K-L distance"),
+              list(co=  "inter", xvar = "logFC", ymax=5, xlab="log fold-change singing x song destabilization")
+             )
+
+walk(params, function(param) {
+  co = param[["co"]]
+  xvar = param[["xvar"]]
+  ymax = param[["ymax"]]
+  xlabel = param[["xlab"]]
+  co_label = sub("position%s.", "", co)
+  res_cur = res %>% filter(coef==co)
+  
+  
+  res_cur = res_cur %>% mutate(padjust_signed = -1 * log10(adj.P.Val))  %>%
+    mutate(padjust_signed = if_else(padjust_signed>ymax, ymax, padjust_signed))
+  
+  
+  info2 = se1@meta.data
+  pos_pos2_all = info2 %>% distinct(position, position2, position_pretty) %>%
+    mutate(songsystem = as.integer(position %in% c("ra", "hvc", "lman", "x"))) %>%
+    mutate(col = position_colors[match(position, names(position_colors))])
+  positions = intersect(position_levels, unique(res_cur$position))
+  
+  
+  ## Set y max
+  res_cur = res_cur %>% left_join(pos_pos2_all %>% select(position, position2))
+  y_max = res_cur %>% 
+    group_by(position2) %>%
+    summarize(y_max = max(padjust_signed))
+  res_cur = res_cur %>%
+    left_join(y_max)
+  
+  res_cur = res_cur %>% left_join(pos_pos2_all) %>%
+    mutate(color_sig = if_else(padjust_signed>1, col, "grey50")) %>%
+    mutate(position = factor(position, levels=position_levels),
+           position_pretty = factor(position_pretty, levels=position_pretty_levels))
+  
+  gg = ggplot(res_cur, aes_string(xvar, "padjust_signed", color="color_sig")) +
+    scale_color_identity() + 
+    geom_hline(yintercept=1, linetype=1, size=.25, color="grey") + 
+    geom_vline(xintercept=0, linetype=1, size=.25, color="grey") + 
+    geom_point(size = .25) +
+    scale_y_continuous(limits=c(0, ymax)) + 
+    facet_wrap(~position_pretty, ncol=2) +
+    labs(x=xlabel,
+         y="-log10(adjusted p-value)") + 
+    theme_bw() + 
+    theme(legend.position="none",
+          axis.title = element_text(size=6),
+          axis.text = element_text(size=5),
+          axis.line = element_line(size=.1),
+          axis.ticks  = element_line(size=.1),
+          strip.background = element_rect(size=1),
+          strip.text = element_text(size=6, face="bold", margin = margin(1,0,1,0)),
+          panel.grid = element_blank()
+    ) 
+  gg
+  save_plot(file.path(volcano_dir, sprintf("combined_grid_%s_no_text.pdf", co_label)), gg, ncol=2, nrow=4, base_height=1.2, base_aspect_ratio = .8)
+})
+```
+
+```{r}
+params = list(
+  list(co = "num_songs_euth_date", xvar = "logFC", ymax = 5, xlab = "log fold-change # songs on euthanasia date"),
+  list(co = "num_songs_pre", xvar = "logFC", ymax = 5, xlab = "log fold-change # songs on euthanasia date"),
+  list(co = "kl_mean_3", xvar = "logFC", ymax = 5, xlab = "log fold-change mean K-L distance"),
+  list(co=  "inter", xvar = "logFC", ymax=5, xlab="log fold-change singing x song destabilization")
+)
+
+walk(params, function(param) {
+  co = param[["co"]]
+  xvar = param[["xvar"]]
+  ymax = param[["ymax"]]
+  xlabel = param[["xlab"]]
+  co_label = sub("position%s.", "", co)
+  res_cur = res %>% filter(coef==co)
+  
+  res_cur = res_cur %>% mutate(padjust_signed = -1 * log10(adj.P.Val))  %>%
+    mutate(padjust_signed = if_else(padjust_signed>ymax, ymax, padjust_signed)) %>%
+    mutate(sig = padjust_signed>1)
+  
+  info2 = se1@meta.data
+  pos_pos2_all = info2 %>% distinct(position, position2, position_pretty) %>%
+    mutate(songsystem = as.integer(position %in% c("ra", "hvc", "lman", "x"))) %>%
+    mutate(col = position_colors[match(position, names(position_colors))])
+  positions = intersect(position_levels, unique(res_cur$position))
+  
+  ## Set y max
+  res_cur = res_cur %>% left_join(pos_pos2_all %>% select(position, position2))
+  y_max = res_cur %>% 
+    group_by(position2) %>%
+    summarize(y_max = max(padjust_signed))
+  res_cur = res_cur %>%
+    left_join(y_max)
+  
+  res_cur = res_cur %>% left_join(pos_pos2_all) %>%
+    mutate(color_sig = if_else(padjust_signed>1, col, "grey50")) %>%
+    mutate(position = factor(position, levels=position_levels),
+           position_pretty = factor(position_pretty, levels=position_pretty_levels))
+  
+  
+  sig_label = res_cur %>% 
+    filter(sig) %>%
+    group_by(position) %>% 
+    top_n(-10, wt = adj.P.Val) %>%
+      mutate(gene_id_sig = gene_id) %>%
+    select(position, gene_id_sig, gene_id)
+  res_cur = res_cur %>% left_join(sig_label) %>%
+    mutate(point_color = if_else(is.na(gene_id_sig), color_sig, "black"))
+
+  
+  gg = ggplot(res_cur, aes_string(xvar, "padjust_signed", fill="color_sig", color="point_color")) +
+    scale_color_identity() + 
+    scale_fill_identity() + 
+    geom_hline(yintercept=1, linetype=1, size=.25, color="grey") + 
+    geom_vline(xintercept=0, linetype=1, size=.25, color="grey") + 
+    geom_point(size = .25, shape=21) +
+    geom_text_repel(aes(label=gene_id_sig), size=5/2.83, segment.size = .25) + 
+    scale_y_continuous(limits=c(0, ymax)) + 
+    facet_wrap(~position_pretty, ncol=2) +
+    labs(x=xlabel,
+         y="-log10(adjusted p-value)") + 
+    theme_bw() + 
+    theme(legend.position="none",
+          axis.title = element_text(size=6),
+          axis.text = element_text(size=5),
+          axis.line = element_line(size=.1),
+          axis.ticks  = element_line(size=.1),
+          strip.background = element_rect(size=1, linetype = "blank"),
+          strip.text = element_text(size=6, face="bold", margin = margin(1,0,1,0)),
+          panel.grid = element_blank()
+    ) 
+  gg
+  save_plot(file.path(volcano_dir, sprintf("combined_grid_%s_text.pdf", co_label)), gg, ncol=2, nrow=4, base_height=1.2, base_aspect_ratio = .8)
+})
+```
+
+```{r}
+params = list(
+  list(co = "num_songs_euth_date", xvar = "logFC", ymax = 5, xlab = "log fold-change # songs on euthanasia date"),
+  list(co = "num_songs_pre", xvar = "logFC", ymax = 5, xlab = "log fold-change # songs on euthanasia date"),
+  list(co = "kl_mean_3", xvar = "logFC", ymax = 5, xlab = "log fold-change mean K-L distance"),
+  list(co=  "inter", xvar = "logFC", ymax=5, xlab="log fold-change singing x song destabilization")
+)
+
+positions = as.character(positions)
+walk(positions, function(p) {
+  walk(params, function(param) {
+    co = param[["co"]]
+    xvar = param[["xvar"]]
+    ymax = param[["ymax"]]
+    xlabel = param[["xlab"]]
+    co_label = sub("position%s.", "", co)
+    res_cur = res %>% filter(coef==co)
+    
+    
+    res_cur = res_cur %>% 
+      filter(position==p) %>%
+      mutate(padjust_signed = -1 * log10(adj.P.Val))  %>%
+      mutate(padjust_signed = if_else(padjust_signed>ymax, ymax, padjust_signed)) %>%
+      mutate(sig = padjust_signed>1)
+    
+    
+    info2 = se1@meta.data
+    pos_pos2_all = info2 %>%
+      distinct(position, position2, position_pretty) %>%
+      mutate(songsystem = as.integer(position %in% c("ra", "hvc", "lman", "x"))) %>%
+      mutate(col = position_colors[match(position, names(position_colors))])
+    positions = intersect(position_levels, unique(res_cur$position))
+    
+    
+    ## Set y max
+    res_cur = res_cur %>% 
+      left_join(pos_pos2_all %>% select(position, position2))
+    y_max = res_cur %>% 
+      group_by(position2) %>%
+      summarize(y_max = max(padjust_signed))
+    res_cur = res_cur %>%
+      left_join(y_max)
+    
+    res_cur = res_cur %>% left_join(pos_pos2_all) %>%
+      mutate(color_sig = if_else(padjust_signed>1, col, "grey50")) %>%
+      mutate(position = factor(position, levels=position_levels),
+             position_pretty = factor(position_pretty, levels=position_pretty_levels))
+    
+    
+    sig_label = res_cur %>% 
+      filter(sig) %>%
+      group_by(position) %>% 
+      top_n(-10, wt = adj.P.Val) %>%
+      mutate(gene_id_sig = gene_id) %>%
+      select(position, gene_id_sig, gene_id)
+    res_cur = res_cur %>% left_join(sig_label) %>%
+      mutate(point_color = if_else(is.na(gene_id_sig), color_sig, "black"))
+    
+    
+    gg = ggplot(res_cur, aes_string(xvar, "padjust_signed", fill="color_sig", color="point_color")) +
+      scale_color_identity() + 
+      scale_fill_identity() + 
+      geom_hline(yintercept=1, linetype=1, size=.25, color="grey") + 
+      geom_vline(xintercept=0, linetype=1, size=.25, color="grey") + 
+      geom_point(size = .25, shape=21) +
+      geom_text_repel(aes(label=gene_id_sig), size=5/2.83, segment.size = .25) + 
+      scale_y_continuous(limits=c(0, ymax)) + 
+      labs(x=xlabel,
+           y="-log10(adjusted p-value)") + 
+      theme_bw() + 
+      theme(legend.position="none",
+            axis.title = element_text(size=6),
+            axis.text = element_text(size=5),
+            axis.line = element_line(size=0),
+            axis.ticks  = element_line(size=.1),
+            strip.background = element_rect(size=1, linetype = "blank"),
+            strip.text = element_text(size=6, face="bold", margin = margin(1,0,1,0)),
+            panel.grid = element_blank()
+      ) 
+    gg
+    save_plot(file.path(volcano_dir, sprintf("%s_%s_text.pdf", p, co_label)), gg, ncol=1, nrow=1, base_height=1.2, base_aspect_ratio = .8)
+  })
+})
+```
+
+## DEG score
+```{r}
+deg_dir = file.path(outdir2, "deg_scores")
+dir.create(deg_dir)
+```
+
+```{r}
+params = list(
+  list(co = "kl_mean_3", xvar = "logFC", ymax = 5, xlab = "log fold-change mean K-L distance"))
+
+res_sum = res %>%
+  mutate(padjust_signed = -1 * log10(adj.P.Val)) %>%
+  filter(padjust_signed>1) %>%
+  mutate(sign = sign(logFC)) %>%
+  ungroup() %>% 
+  group_by(coef, position, sign) %>%
+  summarize(score = sum(padjust_signed)) %>%
+  ungroup() %>% 
+  mutate(score_sign = score * sign) %>%
+  mutate(position_sign = ifelse(sign>0, as.character(position), NA))
+
+coefs_to_plot = map_chr(params, "co")
+res_sum_to_plot = res_sum %>% filter(coef %in% coefs_to_plot )
+min_y = min(res_sum_to_plot$score_sign)
+max_y = max(res_sum_to_plot$score_sign)
+
+walk(params, function(param) {
+  co = param[["co"]]
+  
+  co_label = sub("position%s.", "", co)
+  res_cur = res_sum %>% 
+    filter(coef==co) %>%
+    mutate(position = factor(position, levels=c("ra", "arco", "hvc", "ncl", "lman", "nido", "x", "stri"))) %>%
+    complete(position, fill=list(score = 0, score_sign = 0))
+  
+  gg = ggplot(res_cur, aes(position, score_sign)) + 
+    geom_bar(stat="identity", aes(color=position, fill=position_sign), size=.25) + 
+    scale_fill_manual(name = "",values=position_colors, guide=F, na.value=NA) + 
+    scale_color_manual(values=position_colors, guide=F) + 
+    ylim(min_y, max_y) + 
+    labs(y="DEG score", title=co) + 
+    theme_bw() + 
+    theme(axis.text.x = element_blank(),
+          axis.text.y = element_text(size=5),
+          axis.title.y = element_text(size=6),
+          axis.title.x = element_blank(),
+          axis.line = element_blank(),
+          axis.ticks.y = element_line(size=.25),
+          axis.ticks.x = element_blank(),
+          panel.grid.major.x=element_blank(),  
+          panel.grid.minor.y = element_blank())
+  print(gg)
+  save_plot(file.path(deg_dir, sprintf("%s.pdf" ,co_label)), gg, base_height = 1, base_width=1.2)
+})
+```
+```{r}
+params = list(
+  list(co = "num_songs_euth_date", xvar = "logFC", ymax = 5, xlab = "log fold-change # songs on euthanasia date"),
+  list(co = "num_songs_pre", xvar = "logFC", ymax = 5, xlab = "log fold-change # songs on euthanasia date"),
+  list(co=  "inter", xvar = "logFC", ymax=5, xlab="log fold-change singing x song destabilization")
+)
+
+res_sum = res %>%
+  mutate(padjust_signed = -1 * log10(adj.P.Val)) %>%
+  filter(padjust_signed>1) %>%
+  mutate(sign = sign(logFC)) %>%
+  ungroup() %>% 
+  group_by(coef, position, sign) %>%
+  summarize(score = sum(padjust_signed)) %>%
+  ungroup() %>% 
+  mutate(score_sign = score * sign) %>%
+  mutate(position_sign = ifelse(sign>0, as.character(position), NA))
+
+coefs_to_plot = map_chr(params, "co")
+res_sum_to_plot = res_sum %>% filter(coef %in% coefs_to_plot )
+min_y = min(res_sum_to_plot$score_sign)
+max_y = max(res_sum_to_plot$score_sign)
+
+walk(params, function(param) {
+  co = param[["co"]]
+  
+co_label = sub("position%s.", "", co)
+res_cur = res_sum %>% 
+  filter(coef==co) %>%
+  mutate(position = factor(position, levels=c("ra", "arco", "hvc", "ncl", "lman", "nido", "x", "stri"))) %>%
+  complete(position, fill=list(score = 0, score_sign = 0))
+
+gg = ggplot(res_cur, aes(position, score_sign)) + 
+  geom_bar(stat="identity", aes(color=position, fill=position_sign), size=.25) + 
+  scale_fill_manual(name = "",values=position_colors, guide=F, na.value=NA) + 
+  scale_color_manual(values=position_colors, guide=F) + 
+  ylim(min_y, max_y) + 
+  labs(y="DEG score", title=co) + 
+  theme_bw() + 
+  theme(axis.text.x = element_blank(),
+        axis.text.y = element_text(size=5),
+        axis.title.y = element_text(size=6),
+        axis.title.x = element_blank(),
+        axis.line = element_blank(),
+        axis.ticks.y = element_line(size=.25),
+        axis.ticks.x = element_blank(),
+        panel.grid.major.x=element_blank(), 
+        panel.grid.minor.y = element_blank())
+print(gg)
+save_plot(file.path(deg_dir, sprintf("%s.pdf" ,co_label)), gg, base_height = 1, base_width=1.2)
+}) 
+```
+## Intersection
+```{r}
+intersect_dir = file.path(outdir2, "intersections")
+dir.create(intersect_dir)
+```
+
+Hypergeometric p-values of gene list intersections
+```{r}
+np = length(positions)
+Ngenes = length(unique(res$gene_id))
+interp_mat = matrix(0, ncol=np, nrow=np)
+
+n_genes = 250
+coef_to_use = "kl_mean_3"
+res_sig = res %>%
+  filter(coef == coef_to_use) %>%
+  group_by(position) %>% 
+  top_n(-1 * n_genes, P.Value) %>%
+  mutate(position = droplevels(position))
+res_sig_split = split(res_sig, res_sig$position)
+res_sig_split = map(res_sig_split, function(x) x$gene_id)
+
+dimnames(interp_mat) = list(positions, positions)
+
+for (i in positions) {
+  for (j in positions) {
+    ovlp = length(intersect(res_sig_split[[i]], res_sig_split[[j]]))
+    length1 = length(res_sig_split[[i]])
+    length2 = length(res_sig_split[[j]])
+    if (length1 == 0 | length2 == 0) {
+      interp_mat[i,j] = 0
+    } else {
+      interp_mat[i,j] = -1 * log10(phyper(q=ovlp, m=length1, n = Ngenes - length1, k = length2, log.p = F, lower.tail=F))
+    }
+  }
+}
+
+
+positions_ordered = intersect( position_levels, positions)
+interp_mat = interp_mat[positions_ordered, positions_ordered]
+interp_mat[is.infinite(interp_mat)]  = NA
+
+cols = colorRamp2(breaks=seq(0, max(interp_mat, na.rm=T), length.out=11), colors=viridis_pal()(11))
+width = 1
+height = width
+hm = Heatmap(interp_mat, col=cols,
+             cluster_rows = F,
+             cluster_columns = F,
+             width = unit(width, "in"),
+             height = unit(height, "in"))
+hm
+pdf(file.path(intersect_dir, sprintf("phyper_intersect_heatmap_%s.pdf", coef_to_use)), height = height+2, width = width + 2)
+print(hm)
+dev.off()
+
+positions_song = c("ra", "hvc", "lman", "x")
+lt = which(lower.tri(interp_mat), arr.ind=T)
+interp_mat_m = data.frame(Var1 = rownames(interp_mat)[lt[,1]], Var2 = colnames(interp_mat)[lt[,2]], value = interp_mat[lt])
+interp_mat_m = interp_mat_m %>% 
+  mutate(class = case_when(Var1 %in% positions_song & Var2 %in% positions_song ~ "song-song",
+                           !(Var1 %in% positions_song) & !(Var2 %in% positions_song) ~ "nsong-nsong",
+                           TRUE ~ "song-nsong")) %>%
+  filter(Var1 != Var2) %>%
+  mutate(class = factor(class, levels=c("song-song", "song-nsong", "nsong-nsong")))
+
+gg = ggplot(interp_mat_m, aes(class, value)) + 
+  geom_boxplot(aes(fill=class)) + 
+  scale_fill_npg(guide="none") + 
+  theme_bw() +
+  theme(axis.text = element_text(size=5)) +
+  labs(x="", y="")
+gg
+save_plot(file.path(intersect_dir, sprintf("phyper_intersect_distribution_%s.pdf", coef_to_use)), gg, base_height = 2, base_asp = .5)
+```
+
+Signed
+```{r}
+np = length(positions)
+Ngenes = length(unique(res$gene_id))
+
+n_genes = 250
+coef_to_use = "kl_mean_3"
+res_sig = res %>%
+  filter(coef == coef_to_use) %>%
+  mutate(sign = sign(logFC)) %>%
+  group_by(position, sign) %>% 
+  top_n(-1 * n_genes, P.Value) %>%
+  mutate(position = droplevels(position)) %>%
+  mutate(position_sign = paste(position, sign, sep="_"))
+
+res_sig_split = map(c(1, -1), function(si) {
+  res_sig1 = res_sig %>% filter(sign == si) 
+  map(positions, function(p) {
+    res_sig2 = res_sig1 %>%
+      filter(position == p)
+    res_sig2$gene_id
+  }) %>% set_names(positions)
+}) %>% set_names(c("pos", "neg"))
+
+
+
+mats = map(c("pos", "neg"), function(si) {
+  res_sig_split_cur = res_sig_split[[si]]
+  interp_mat = matrix(0, ncol=np, nrow=np)
+  dimnames(interp_mat) = list(positions, positions)
+  for (i in positions) {
+    for (j in positions) {
+      ovlp = length(intersect(res_sig_split_cur[[i]], res_sig_split_cur[[j]]))
+      length1 = length(res_sig_split_cur[[i]])
+      length2 = length(res_sig_split_cur[[j]])
+      if (length1 == 0 | length2 == 0) {
+        interp_mat[i,j] = 0
+      } else {
+        interp_mat[i,j] = -1 * log10(phyper(q=ovlp, m=length1, n = Ngenes - length1, k = length2, log.p = F, lower.tail=F))
+      }
+    }
+  }
+  interp_mat[is.infinite(interp_mat)]  = NA
+  interp_mat
+}) %>% set_names(names(res_sig_split))
+
+positions_ordered = intersect( position_levels, positions)
+
+interp_mat_max = max(map_dbl(mats, max, na.rm=T), na.rm=T)
+map(names(res_sig_split), function(si) {
+  interp_mat = mats[[si]]
+  interp_mat = interp_mat[positions_ordered, positions_ordered]
+  
+  
+  cols = colorRamp2(breaks=seq(0, interp_mat_max, length.out=11), colors=viridis_pal()(11))
+  width = 1
+  height = width
+  hm = Heatmap(interp_mat, col=cols,
+               cluster_rows = F,
+               cluster_columns = F,
+               width = unit(width, "in"),
+               height = unit(height, "in"))
+  hm
+  pdf(file.path(intersect_dir, sprintf("phyper_intersect_heatmap_%s_%s.pdf", coef_to_use, si)), height = height+2, width = width + 2)
+  print(hm)
+  dev.off()
+})
+
+positions_song = c("ra", "hvc", "lman", "x")
+interp_mat_m = map(mats, function(interp_mat) {
+  lt = which(lower.tri(interp_mat), arr.ind=T)
+  interp_mat_m = data.frame(Var1 = rownames(interp_mat)[lt[,1]], Var2 = colnames(interp_mat)[lt[,2]], value = interp_mat[lt])
+  interp_mat_m = interp_mat_m %>% 
+    mutate(class = case_when(Var1 %in% positions_song & Var2 %in% positions_song ~ "song-song",
+                             !(Var1 %in% positions_song) & !(Var2 %in% positions_song) ~ "nsong-nsong",
+                             TRUE ~ "song-nsong")) %>%
+    filter(Var1 != Var2) %>%
+    mutate(class = factor(class, levels=c("song-song", "song-nsong", "nsong-nsong")))
+  
+  interp_mat_m
+}) %>% set_names(names(mats)) %>%  bind_rows(.id="sign")
+
+gg = ggplot(interp_mat_m, aes(class, value)) + 
+  geom_boxplot(aes(fill=class), size=.25, outlier.size=.25) + 
+  scale_fill_npg(guide="none") + 
+  theme_bw() +
+  theme(axis.text = element_text(size=5),
+        panel.grid=element_blank()) +
+  labs(x="", y="") + 
+  facet_grid(.~sign)
+gg
+save_plot(file.path(intersect_dir, sprintf("phyper_intersect_distribution_signed_%s.pdf", coef_to_use)), gg, base_height = 1.8, base_asp = .4, ncol=2)
+
+
+```
+
+## GSEA
+```{r}
+gsea_dir = file.path(outdir2, "gsea")
+dir.create(gsea_dir)
+```
+
+```{r}
+gmt_dir = file.path(base_dir, "deaf_gex", "seq_analysis", "common_data")
+gmt_files = list.files(gmt_dir, full.names = T)
+gmt_files = gmt_files[grep("c5.all.v7", gmt_files)]
+
+gmt_pathway = gmtPathways(gmt_files)
+to_exclude = names(gmt_pathway)
+to_exclude = to_exclude[grep("ENDOPLAS|RIBOSOM|TRANSLATION|METABO|CATABOL|RESPIR|HYDROGEN|OXIDAT|OXIDO|MITOCH|PROTON|VIRAL|ELECTRON|ATP|RRNA|BIOSYNTHETIC|INORGANIC|INNER_MEMBRANE", to_exclude)] ## Large variation in associated genes across indivduals
+gmt_pathway = gmt_pathway[!(names(gmt_pathway) %in% to_exclude)]
+
+gray_gmt_fname = file.path(gmt_dir, "gray_2018_arg.gmt") ## Obtained from Tyssowski, K. M. et al. Different Neuronal Activity Patterns Induce Different Gene Expression Programs. Neuron 98, 530–546.e11 (2018)
+gray_gmt = gmtPathways(gray_gmt_fname)
+names(gray_gmt) = make.names(names(gray_gmt))
+gmt_gray_pathway = c(gmt_pathway, gray_gmt)
+```
+
+```{r}
+positions = as.character(unique(res$position))
+coefs = unique(res$coef)
+
+plan(multisession, workers = length(positions))
+options(future.globals.maxSize = 1024^2 * 5000)
+```
+
+```{r message=FALSE, warning=FALSE}
+
+gsea_res_fname = file.path(gsea_dir, "gsea_res.qs")
+gsea_res_ind_fname = file.path(gsea_dir, "gsea_res_ind.qs")
+
+redo = T
+if (redo) {
+  positions = unique(res$position)
+  
+  gsea_res = future_map(positions, function(p) {
+    print(p)
+    res_cur = res %>% filter(position == p)
+    map(coefs, function(co) {
+      print(p)
+      res_cur1 = res_cur  %>% filter(coef==co)
+      rnks = res_cur1$t
+      names(rnks) = res_cur1$gene_id
+      rnks = sort(rnks)
+      gsea_res = fgseaMultilevel(pathways = gmt_gray_pathway,
+                                 stats = rnks,
+                                 minSize=20,
+                                 maxSize=200)
+      return(gsea_res)
+      
+    }) %>% set_names(coefs) %>% bind_rows(.id="coef")
+  })  %>% set_names(positions) %>% bind_rows(.id="position")
+  
+  gsea_res_ind = future_map(positions, function(p) {
+    print(p)
+    res_cur = res %>% filter(position == p)
+    gsea_res_cur = gsea_res %>% filter(position==p)
+    map(coefs, function(co) {
+      res_cur1 = res_cur  %>% filter(coef==co)
+      gsea_res_cur1 = gsea_res_cur %>% filter(coef==co)
+      rnks = res_cur1$t
+      names(rnks) = res_cur1$gene_id
+      rnks = sort(rnks)
+      gsea_res_filt = gsea_res_cur1 %>% filter(padj<.2) %>% arrange(pval)
+      collapsedPathways = collapsePathways(gsea_res_filt, pathways = gmt_gray_pathway, stats = rnks, pval.threshold = .05)
+      gsea_res_ind = gsea_res_cur1 %>% filter(pathway %in% collapsedPathways$mainPathways) %>%
+        arrange(-NES)
+      gsea_res_ind
+    }) %>% set_names(coefs) %>% bind_rows(.id="coef")
+  }) %>% bind_rows()
+  
+  qsave(gsea_res, gsea_res_fname)
+  qsave(gsea_res_ind, gsea_res_ind_fname)
+} else {
+  gsea_res = qread(gsea_res_fname)
+  gsea_res_ind = qread(gsea_res_ind_fname)
+}
+```
+
+###### Heatmap
+```{r}
+coefs = c("kl_mean_2_hearing", "kl_mean_2_deaf", "kl_mean_3", "num_songs_euth_date", "num_songs_pre", "inter")
+walk(coefs, function(co) {
+  print(co)
+  co_label = sub("position%s.", "", co)
+  gsea_res_ind_filt = gsea_res_ind %>% 
+    filter(padj<.1) %>%
+    filter(coef==co)
+  
+  gsea_res_filt = gsea_res %>% 
+    mutate(padj_signed = sign(NES) *  -1 * log10(padj)) %>% 
+    filter(pathway %in% gsea_res_ind_filt$pathway)
+  
+  mat = gsea_res_filt %>% filter(coef==co) %>%
+    select(position, pathway, padj_signed) %>%
+    pivot_wider(names_from = "position", values_from = "padj_signed", values_fill=list(NES=0)) %>%
+    column_to_rownames("pathway") %>% 
+    as.matrix() 
+  
+  mat = mat[,intersect(position_levels, colnames(mat))]
+  
+  max_val = 1.5
+  cols_cur = colorRamp2(breaks=c(-1*max_val, 0, max_val), colors = c(muted("purple"), "white", muted("orange")))
+  
+  width = .5
+  height = 2.5
+  hm = Heatmap(mat, 
+               cluster_columns=F, col = cols_cur,
+               clustering_method_rows = "ward.D",
+               width = unit(width, "in"),
+               height = unit(height, "in"))
+  hm
+  
+  pdf(file.path(gsea_dir, sprintf("heatmap_pval_%s.pdf", co_label)), width=width + 8, height=height + 2)
+  print(hm)
+  dev.off()
+  
+  width = 1
+  height = width * nrow(mat) / ncol(mat)
+  
+  hm = Heatmap(mat, 
+               cluster_columns=F, col = cols_cur,
+               clustering_method_rows = "ward.D",
+               width = unit(width, "in"),
+               height = unit(height, "in"))
+  hm
+  
+  pdf(file.path(gsea_dir, sprintf("heatmap_pval_%s_big.pdf", co_label)), width=width + 8, height=height + 2)
+  print(hm)
+  dev.off()
+})
+```
+
+```{r}
+coefs_to_use = list(c("kl_mean_3"))
+walk(coefs_to_use, function(coef_to_use) { 
+  gsea_res_ind_select = gsea_res_ind %>% 
+    filter(coef %in% coef_to_use) %>% 
+    mutate(p.adjust_sign = -1 * log10(padj)) %>%
+    mutate(NES_sign = sign(NES)) %>%
+    filter(padj<.1) %>% 
+    group_by(position, NES_sign) %>%
+    top_n(5, abs(NES))
+  
+  gsea_res_ind_filt = gsea_res_ind %>% 
+    filter(coef %in% coef_to_use) %>% 
+    filter(pathway %in% gsea_res_ind_select$pathway) %>%
+    distinct(position, pathway, .keep_all=T) %>%
+    mutate(pathway = sub("^GO", "", pathway ),
+           pathway = gsub("_", " ", pathway)) %>% 
+    mutate(pathway = case_when(grepl("NONSENSE MEDIATED DECAY",pathway) ~ "NONSENSE MEDIATED DECAY",
+                               grepl("SERINE THREONINE KINASE", pathway) ~ "SERINE THREONINE KINASE SIGNALING",
+                               TRUE ~ pathway))
+  
+  go_res_mat = gsea_res_ind_filt %>% select(position, pathway, NES) %>%
+    pivot_wider(names_from = "position", values_from = "NES", values_fill = list(NES= 0)) %>%
+    column_to_rownames("pathway") %>% as.matrix()
+  
+  hc_row = hclust(dist(go_res_mat), method="complete")
+  hc_row_order = hc_row$labels[hc_row$order]
+  
+  
+  gsea_res_ind_filt = gsea_res_ind_filt %>% 
+    mutate(leadingEdge_len = map_int(leadingEdge, length))
+  
+  gsea_res_ind_filt = gsea_res_ind_filt %>%
+    mutate(pathway = factor(pathway, levels=hc_row_order)) %>%
+    mutate(position = factor(position, levels=c("ra", "arco", "hvc", "ncl", "lman", "nido", "x", "stri"))) %>%
+    complete(pathway, position, fill=list(NES=NA, size=NA, leadingEdge_len = NA))
+  
+  size_limits = seq(round(min(gsea_res_ind_filt$size, na.rm=T), -1), round(max(gsea_res_ind_filt$size, na.rm=T), -1), by=50)
+  size_limits = seq(round(min(gsea_res_ind_filt$leadingEdge_len, na.rm=T), -1), round(max(gsea_res_ind_filt$leadingEdge_len, na.rm=T), -1), by=20)
+  gg = ggplot(gsea_res_ind_filt, aes(position, pathway)) + 
+    geom_point(aes(size=leadingEdge_len, color=NES)) + 
+    scale_color_gradient2(low=muted("blue"), high=muted("red")) +
+    scale_size_continuous(range=c(.5, 3), breaks=size_limits) + 
+    labs(x = "", y ="") + 
+    theme_bw() + 
+    theme(axis.text.x = element_text(angle=90, vjust=.5, hjust=1, size=6),
+          axis.text.y = element_text(hjust=1, size=6),
+          axis.ticks = element_line(size=.25),
+          panel.border = element_blank()) + 
+    coord_fixed()
+  print(gg)
+  ncols = ncol(go_res_mat)
+  nrows = nrow(go_res_mat)
+  
+  width = ncols / 10
+  height = nrows / 10
+  gg = set_panel_size(gg, width = unit(width, "in"), height = unit(height, "in"))
+  save_plot(file.path(gsea_dir, sprintf("go_terms_by_module_%s.pdf", paste(coef_to_use, collapse="-"))), gg, base_height = (nrows / 2) + 4, base_width = (ncols / 2) + 4)
+})
+```
+
+###### Plot leading edges
+```{r}
+pathways_to_use = c(
+  "GO_GLIAL_CELL_DIFFERENTIATION",
+  "GO_NEURON_SPINE",
+  "GO_HORMONE_ACTIVITY",
+  "GO_POSITIVE_REGULATION_OF_NEURON_DEATH",
+  "GO_PRIMARY_ACTIVE_TRANSMEMBRANE_TRANSPORTER_ACTIVITY",
+  "GO_DNA_BINDING_TRANSCRIPTION_ACTIVATOR_ACTIVITY",
+  "GO_BRANCHING_MORPHOGENESIS_OF_AN_EPITHELIAL_TUBE"
+)
+coef_to_use = c("kl_mean_3")
+
+nrows = 5
+positions = as.character(positions)
+walk(positions, function(p) {
+  walk(pathways_to_use, function(pathway_to_use) {
+    print(pathway_to_use)
+    gsea_res_ind1 = gsea_res %>% 
+      filter(pathway==pathway_to_use) %>%
+      filter(coef==coef_to_use) %>%
+      filter(position==p) 
+    genes = unique(gsea_res_ind1$leadingEdge[[1]])[1:20]
+    
+    line_color = position_colors[p]
+    
+    res_select = res %>% 
+      filter(coef == coef_to_use)  %>%
+      filter(position == p) %>%
+      filter(gene_id %in% genes) %>%
+      mutate(coef = factor(coef, levels=c("baseline", coef_to_use))) %>%
+      complete(coef, gene_id, fill=list(logFC=0, std_error=0))
+    
+    df_group_sum = res_select  %>%
+      group_by(coef) %>%
+      summarize_at(vars(logFC,std_error), list(mean = mean)) %>%
+      ungroup()
+    
+    gg = ggplot() + 
+      geom_hline(yintercept=0, linetype=1, size=.25) + 
+      geom_line(data=res_select, color="grey", alpha=.5, aes(coef, logFC,  group=gene_id), size=.25) +
+      geom_line(data=df_group_sum, color=line_color, aes(coef, logFC_mean, group=1)) +
+      labs(x = "", y = "logFC") + 
+      theme_bw() + 
+      theme(
+        legend.position="none",
+        strip.text = element_text(size=6, face="italic", hjust=0, vjust=1),
+        strip.background = element_blank(),
+        axis.title.y = element_text(size=6),
+        axis.title.x = element_blank(),
+        axis.text.y = element_text(size=5),
+        axis.text.x = element_blank(),
+        axis.line = element_blank(),
+        axis.ticks.y = element_line(size=.25),
+        axis.ticks.x = element_blank(),
+        panel.grid=element_blank()
+      )
+    print(gg)
+    width = .5
+    height = .6
+    gg = set_panel_size(gg, width = unit(width, "in"), height = unit(height, "in"))
+    save_plot(file.path(gsea_dir, sprintf("points_by_kl_mean_log_scale_cut2_proc2-low-hi_logFC_%s_%s_grouped.pdf", p, pathway_to_use)), gg, base_height=2, base_width=2, ncol=1, nrow=1)
+    
+  })
+})
+
+```
