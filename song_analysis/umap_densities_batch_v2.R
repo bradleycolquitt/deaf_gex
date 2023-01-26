@@ -10,8 +10,9 @@ library(cowplot)
 source("~/data2/rstudio/birds/utils/db.R")
 source("~/data2/rstudio/birds/utils/common_aesthetics.R")
 source("~/data2/rstudio/birds/utils/stats.R")
-# Directory setup ---------------------------------------------------------
 
+
+# Directory setup ---------------------------------------------------------
 
 birds = c(
   "pu37bk12",
@@ -110,7 +111,6 @@ if (redo) {
     baselines = as.character(dates[dates<=0])
     res_baseline_mean = apply(simplify2array(res[baselines]), 1:2, mean)
     res_baseline_sd = apply(simplify2array(res[baselines]), 1:2, sd)
-    #res_diff = map(res, function(x) (x - res_baseline_mean) / res_baseline_sd)
     res_diff = map(res, function(x) (x - res_baseline_mean))
     
     res_diff_df = map(res_diff, function(rd) {
@@ -127,7 +127,7 @@ if (redo) {
     qsave(res_df, file.path(out_dir, sprintf("%s_%s_density.qs", bird_cur, umap_to_use)))
     qsave(res_diff_df, file.path(out_dir, sprintf("%s_%s_density_diff.qs", bird_cur, umap_to_use)))
   }, .progress=T)
- #})
+  
   res_dfs = map_dfr(seq_along(obj_filt_fnames), function(i) {
     obj_filt_fname_cur = obj_filt_fnames[[i]]
     bird_cur = birds[i]
@@ -201,7 +201,6 @@ q99 = function(x) quantile(x, .99)
 q01 = function(x) quantile(x, .01)
 res_diff_stat = res_diff_dfs %>%
   group_by(bird) %>% 
-  #mutate(value = abs(value)) %>% 
   filter(value > 0) %>% 
   mutate(value_z = zscore_my(value, baseline=date_rel<=0)) %>%
   group_by(date_rel) %>%
@@ -209,10 +208,8 @@ res_diff_stat = res_diff_dfs %>%
 
 res_diff_sum = res_diff_dfs %>%
   group_by(bird) %>%
-  #mutate(value = abs(value)) %>% 
   filter(value > 0) %>% 
   filter(date_rel > -5) %>%
-#  filter(date_rel != 1) %>% 
   group_by(date_rel, bird) %>%
   summarize_at(vars(value), list(mean=mean, sd=sd, q99=q99, q01=q01, sum=sum)) %>%
   ungroup() %>%
@@ -286,7 +283,7 @@ print(gg)
 
 save_plot(file.path(out_dir, sprintf("%s_density_sum_z_mean.pdf", umap_to_use)), gg, base_height=2, base_asp=2, ncol=1, nrow=1)
 
-## Fig. 2G
+## Fig. 1G
 gg = ggplot(res_diff_sum_1, aes(date_rel, color=procedure2)) + 
   geom_line(aes(y=sum_mean)) + 
   geom_ribbon(aes(ymin=sum_mean_down, ymax = sum_mean_up, fill=procedure2), alpha=.1, color=NA) + 
