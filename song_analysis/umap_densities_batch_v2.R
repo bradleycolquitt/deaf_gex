@@ -181,6 +181,7 @@ gg = ggplot(res_df, aes(axis1, axis2, fill=value)) +
 gg
 save_plot(file.path(out_dir, sprintf("%s_%s_density.pdf", bird_cur, umap_to_use)), gg, base_height=2, base_asp=1, ncol=ncols, nrow=nrows)
 
+## Fig. 1F
 gg = ggplot(res_diff_df, aes(axis1, axis2, fill=value)) +
   geom_raster() +
   facet_wrap(~date_rel, nrow = nrows, ncol= ncols) +
